@@ -5,7 +5,6 @@ import numpy as np
 import torch
 from .. import nets
 from copy import deepcopy
-from torchvision import transforms
 
 
 class Cal(EarlyTrain):
@@ -49,12 +48,7 @@ class Cal(EarlyTrain):
                                                    pretrained=True).to(self.args.device)
         model.eval()
 
-        # Resize dst_train to 224*224
-        if self.args.im_size[0] != 224 or self.args.im_size[1] != 224:
-            dst_train = deepcopy(self.dst_train)
-            dst_train.transform = transforms.Compose([dst_train.transform, transforms.Resize(224)])
-        else:
-            dst_train = self.dst_train
+        dst_train = self.dst_train
 
         # Calculate the distance matrix and return knn results
         if self.balance:

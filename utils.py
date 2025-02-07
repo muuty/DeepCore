@@ -1,6 +1,5 @@
 import time, torch
 from argparse import ArgumentTypeError
-from prefetch_generator import BackgroundGenerator
 
 
 class WeightedSubset(torch.utils.data.Subset):
@@ -20,7 +19,7 @@ def train(train_loader, network, criterion, optimizer, scheduler, epoch, args, r
     """Train for one epoch on the training set"""
     batch_time = AverageMeter('Time', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
-    top1 = AverageMeter('Acc@1', ':6.2f')
+    mae_meter = AverageMeter('MAE', ':6.3f')  # Regression Metric 추가
 
     # switch to train mode
     network.train()
@@ -28,26 +27,39 @@ def train(train_loader, network, criterion, optimizer, scheduler, epoch, args, r
     end = time.time()
     for i, contents in enumerate(train_loader):
         optimizer.zero_grad()
+
         if if_weighted:
-            target = contents[0][1].to(args.device)
-            input = contents[0][0].to(args.device)
+            target = contents[0][1].to(args.device)  # Target (실수형)
+            input = contents[0][0].to(args.device)  # Input
 
             # Compute output
             output = network(input)
+
+            # ✅ output과 target의 차원 정리
+            output = output.squeeze()  # 필요하면 차원 축소
+            target = target.squeeze()  # 필요하면 차원 축소
+
             weights = contents[1].to(args.device).requires_grad_(False)
             loss = torch.sum(criterion(output, target) * weights) / torch.sum(weights)
         else:
-            target = contents[1].to(args.device)
-            input = contents[0].to(args.device)
+            target = contents[1].to(args.device)  # Target (실수형)
+            input = contents[0].to(args.device)  # Input
 
             # Compute output
             output = network(input)
+
+            # ✅ output과 target의 차원 정리
+            output = output.squeeze()  # 필요하면 차원 축소
+            target = target.squeeze()  # 필요하면 차원 축소
+
             loss = criterion(output, target).mean()
 
-        # Measure accuracy and record loss
-        prec1 = accuracy(output.data, target, topk=(1,))[0]
+        # Measure error instead of accuracy
+        mae = torch.abs(output - target).mean()  # Mean Absolute Error (MAE)
+
+        # Record loss and MAE
         losses.update(loss.data.item(), input.size(0))
-        top1.update(prec1.item(), input.size(0))
+        mae_meter.update(mae.item(), input.size(0))
 
         # Compute gradient and do SGD step
         loss.backward()
@@ -62,11 +74,11 @@ def train(train_loader, network, criterion, optimizer, scheduler, epoch, args, r
             print('Epoch: [{0}][{1}/{2}]\t'
                   'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
                   'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                  'Prec@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
+                  'MAE {mae_meter.val:.3f} ({mae_meter.avg:.3f})'.format(
                 epoch, i, len(train_loader), batch_time=batch_time,
-                loss=losses, top1=top1))
+                loss=losses, mae_meter=mae_meter))  # Accuracy 대신 MAE 출력
 
-    record_train_stats(rec, epoch, losses.avg, top1.avg, optimizer.state_dict()['param_groups'][0]['lr'])
+    record_train_stats(rec, epoch, losses.avg, mae_meter.avg, optimizer.state_dict()['param_groups'][0]['lr'])
 
 
 def test(test_loader, network, criterion, epoch, args, rec):
@@ -206,7 +218,3 @@ def record_ckpt(rec, step):
     rec.ckpts.append(step)
     return rec
 
-
-class DataLoaderX(torch.utils.data.DataLoader):
-    def __iter__(self):
-        return BackgroundGenerator(super().__iter__())

@@ -1,10 +1,12 @@
 import os
 import torch.nn as nn
 import argparse
+import gc
+
 import deepcore.nets as nets
 import deepcore.datasets as datasets
 import deepcore.methods as methods
-from torchvision import transforms
+from deepcore.nets.STGCN.models import STGCNGraphConv
 from utils import *
 from datetime import datetime
 from time import sleep
@@ -14,8 +16,8 @@ def main():
     parser = argparse.ArgumentParser(description='Parameter Processing')
 
     # Basic arguments
-    parser.add_argument('--dataset', type=str, default='CIFAR10', help='dataset')
-    parser.add_argument('--model', type=str, default='ResNet18', help='model')
+    parser.add_argument('--dataset', type=str, default='PemsBay', help='dataset')
+    parser.add_argument('--model', type=str, default='STGCNGraphConv', help='model')
     parser.add_argument('--selection', type=str, default="uniform", help="selection method")
     parser.add_argument('--num_exp', type=int, default=5, help='the number of experiments')
     parser.add_argument('--num_eval', type=int, default=10, help='the number of evaluating randomly initialized models')
@@ -142,9 +144,18 @@ def main():
               ", lr: ", args.lr, ", save_path: ", args.save_path, ", resume: ", args.resume, ", device: ", args.device,
               ", checkpoint_name: " + checkpoint_name if args.save_path != "" else "", "\n", sep="")
 
-        channel, im_size, num_classes, class_names, mean, std, dst_train, dst_test = datasets.__dict__[args.dataset] \
-            (args.data_path)
-        args.channel, args.im_size, args.num_classes, args.class_names = channel, im_size, num_classes, class_names
+        if torch.cuda.is_available():
+            # Set available CUDA devices
+            # This option is crucial for multiple GPUs
+            # 'cuda' ≡ 'cuda:0'
+            device = torch.device('cuda')
+            torch.cuda.empty_cache()  # Clean cache
+        else:
+            device = torch.device('cpu')
+            gc.collect()  # Clean cache
+
+        gso, n_vertex, zscore, train_iter, val_iter, test_iter = datasets.__dict__[args.dataset] \
+            (gso_type="sym_norm_lap", graph_conv_type="graph_conv", device=device, batch_size=32, n_his=12, n_pred=3)
 
         torch.random.manual_seed(args.seed)
 
@@ -158,41 +169,22 @@ def main():
                                   greedy=args.submodular_greedy,
                                   function=args.submodular
                                   )
-            method = methods.__dict__[args.selection](dst_train, args, args.fraction, args.seed, **selection_args)
+            method = methods.Uniform(train_iter, args, args.fraction, args.seed, **selection_args)
             subset = method.select()
         print(len(subset["indices"]))
-
-        # Augmentation
-        if args.dataset == "CIFAR10" or args.dataset == "CIFAR100":
-            dst_train.transform = transforms.Compose(
-                [transforms.RandomCrop(args.im_size, padding=4, padding_mode="reflect"),
-                 transforms.RandomHorizontalFlip(), dst_train.transform])
-        elif args.dataset == "ImageNet":
-            dst_train.transform = transforms.Compose([
-                transforms.RandomResizedCrop(224),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                transforms.Normalize(mean, std)
-            ])
 
         # Handle weighted subset
         if_weighted = "weights" in subset.keys()
         if if_weighted:
-            dst_subset = WeightedSubset(dst_train, subset["indices"], subset["weights"])
+            dst_subset = WeightedSubset(train_iter, subset["indices"], subset["weights"])
         else:
-            dst_subset = torch.utils.data.Subset(dst_train, subset["indices"])
+            dst_subset = torch.utils.data.Subset(train_iter, subset["indices"])
 
         # BackgroundGenerator for ImageNet to speed up dataloaders
-        if args.dataset == "ImageNet":
-            train_loader = DataLoaderX(dst_subset, batch_size=args.train_batch, shuffle=True,
-                                       num_workers=args.workers, pin_memory=True)
-            test_loader = DataLoaderX(dst_test, batch_size=args.train_batch, shuffle=False,
-                                      num_workers=args.workers, pin_memory=True)
-        else:
-            train_loader = torch.utils.data.DataLoader(dst_subset, batch_size=args.train_batch, shuffle=True,
-                                                       num_workers=args.workers, pin_memory=True)
-            test_loader = torch.utils.data.DataLoader(dst_test, batch_size=args.train_batch, shuffle=False,
-                                                      num_workers=args.workers, pin_memory=True)
+        train_loader = torch.utils.data.DataLoader(dst_subset, batch_size=args.train_batch, shuffle=True,
+                                                   num_workers=args.workers, pin_memory=True)
+        test_loader = torch.utils.data.DataLoader(test_iter, batch_size=args.train_batch, shuffle=False,
+                                                  num_workers=args.workers, pin_memory=True)
 
         # Listing cross-architecture experiment settings if specified.
         models = [args.model]
@@ -205,7 +197,15 @@ def main():
             if len(models) > 1:
                 print("| Training on model %s" % model)
 
-            network = nets.__dict__[model](channel, num_classes, im_size).to(args.device)
+            network = STGCNGraphConv(
+                temporal_kernel_size=3,
+                spatio_kernel_size=3,
+                act_func="glu",
+                graph_conv_type="graph_conv",
+                gso=gso,
+                enable_bias=True,
+                droprate=0.5,
+                blocks=[[1],[64,16,64],[128,128],[1]], n_vertex=n_vertex, n_his=12)
 
             if args.device == "cpu":
                 print("Using CPU.")
@@ -219,7 +219,7 @@ def main():
                 # Loading model state_dict
                 network.load_state_dict(checkpoint["state_dict"])
 
-            criterion = nn.CrossEntropyLoss(reduction='none').to(args.device)
+            criterion = nn.MSELoss().to(args.device)
 
             # Optimizer
             if args.optimizer == "SGD":
